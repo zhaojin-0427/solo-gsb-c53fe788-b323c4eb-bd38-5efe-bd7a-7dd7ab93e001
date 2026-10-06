@@ -11,8 +11,10 @@ import dns.rdatatype
 from app.zone import parse_zone, ZoneError
 from app.resolver import Resolver
 from app.diff import (
-    analyze, answer_signature, rel_labels, abs_name, Cone,
+    analyze, answer_signature, rel_labels, abs_name, Cone, build_markers,
+    MAX_PREIMAGE_DEPTH,
 )
+from app.resolver import MAX_ALIAS_HOPS
 
 ORIGIN = "ex."
 
@@ -269,7 +271,10 @@ def assert_sound(b, c, qtype, vocab, rounds=3000):
     random.seed(7)
     for _ in range(rounds):
         labs = tuple(random.choice(vocab)
-                     for _ in range(random.randint(0, 5)))
+                     for _ in range(random.randint(0, 40)))
+        # dnspython 限定全名不超过 255 字节；跳过构造出的超长名。
+        if sum(len(lb) + 1 for lb in labs) > 250:
+            continue
         qn = abs_name(labs, b.origin)
         changed = answer_signature(rb.resolve(qn, qt)) != answer_signature(
             rc.resolve(qn, qt))
@@ -428,6 +433,175 @@ def test_identical_zones_no_patterns():
     c = parse_zone(CHANGE_B, ORIGIN, label="c")
     for t in ("A", "NS"):
         assert analyze(b, c, [dns.rdatatype.from_text(t)])[0].patterns == []
+
+
+# ------------------------------------------------ DNAME 自引用与跳数有限化
+
+SELF_DNAME_HDR = (
+    "$ORIGIN ex.\n$TTL 60\n"
+    "@ SOA ns hm {sn} 1 1 1 1\n NS ns\n"
+    "ns A 192.0.2.1\n"
+    "x.d DNAME d\n"
+)
+
+
+def _self_dname_pair(a1="192.0.2.10", a2="192.0.2.20"):
+    b = parse_zone(
+        SELF_DNAME_HDR.format(sn=1) + f"a.d A {a1}\n", ORIGIN, label="b")
+    c = parse_zone(
+        SELF_DNAME_HDR.format(sn=2) + f"a.d A {a2}\n", ORIGIN, label="c")
+    return b, c
+
+
+def test_self_referential_dname_markers_are_finite():
+    # 回归：旧实现的拉回不动点在 ``x.d DNAME d`` 上无限生成 x.x.d……，
+    # build_markers / analyze 永不返回（POST /impact 无响应）。
+    b, c = _self_dname_pair()
+    markers, _fresh = build_markers(b, c)
+    assert markers == set(markers)  # 能正常返回即通过
+    # 反向拉回深度有限：经一次拉回的 x.d 等存在，但不会无限增长。
+    assert ("d",) in markers and ("x", "d") in markers
+    assert ("x",) * (MAX_ALIAS_HOPS + 5) + ("d",) not in markers
+    td = analyze(b, c, [dns.rdatatype.A])[0]
+    assert td.patterns                      # 必须在有限时间内产出结果
+
+
+def test_self_dname_hop_boundary_patterns():
+    # 与 /resolve 一致：a.x^k.d 经 k 跳 DNAME 改写后命中 a.d。
+    # k <= 31 时末端 a.d 的 A 变化可见；k == 32 触别名跳数上限，不可见。
+    b, c = _self_dname_pair()
+    rb, rc = Resolver(b), Resolver(c)
+    qt = dns.rdatatype.A
+    patterns = analyze(b, c, [qt])[0].patterns
+    scopes = {p.scope.render() for p in patterns}
+
+    expect = {"a.d"} | {f"a.{'x.' * k}d" for k in range(1, MAX_ALIAS_HOPS)}
+    assert scopes == expect
+    assert len(patterns) == MAX_ALIAS_HOPS
+    # 每个模式的见证应答与解析器直接解析完全一致。
+    for p in patterns:
+        qn = p.witness
+        a1, a2 = rb.resolve(qn, qt), rc.resolve(qn, qt)
+        assert answer_signature(p.baseline) == answer_signature(a1)
+        assert answer_signature(p.candidate) == answer_signature(a2)
+
+    # 31 层 x：31 跳，仍取到变化后的 A；32 层 x：32 跳触顶，两版相同。
+    n31 = dns.name.from_text("a." + "x." * 31 + "d", origin=b.origin)
+    n32 = dns.name.from_text("a." + "x." * 32 + "d", origin=b.origin)
+    a31b, a31c = rb.resolve(n31, qt), rc.resolve(n31, qt)
+    a32b, a32c = rb.resolve(n32, qt), rc.resolve(n32, qt)
+    assert len(a31b.hops) == 31 and a31b.termination == "exact"
+    assert answer_signature(a31b) != answer_signature(a31c)
+    assert len(a32b.hops) == MAX_ALIAS_HOPS
+    assert a32b.termination == a32c.termination == "alias_chain_limit"
+    assert answer_signature(a32b) == answer_signature(a32c)
+
+
+def test_self_dname_patterns_sound_with_deep_names():
+    b, c = _self_dname_pair()
+    assert_sound(
+        b, c, "A",
+        ["a", "d", "x", "y", "z", "foo", "ns", "w-0", "ww-0", "*"],
+        rounds=4000,
+    )
+
+
+def test_self_dname_only_present_in_candidate_is_finite_and_sound():
+    # 自引用 DNAME 只在候选版出现：基线 NXDOMAIN 与候选别名链/命中之间的
+    # 变化同样须有限、互斥且完备。
+    hdr = ("$ORIGIN ex.\n$TTL 60\n@ SOA ns hm {sn} 1 1 1 1\n NS ns\n"
+           "ns A 192.0.2.1\n")
+    b = parse_zone(
+        hdr.format(sn=1) + "t A 10.0.0.9\na.t A 10.0.0.10\n",
+        ORIGIN, label="b")
+    c = parse_zone(
+        hdr.format(sn=2)
+        + "t A 10.0.0.9\na.t A 10.0.0.11\nx.t DNAME t\n",
+        ORIGIN, label="c")
+    markers, _ = build_markers(b, c)
+    # 标记深度受反向跳数限制（再深一层的 a.x^32.t 仅可能由前缀闭合得到，
+    # 其自身是结构点；不会出现 a.x^33.t 之类无限拉回产物）。
+    assert ("a",) + ("x",) * (MAX_PREIMAGE_DEPTH + 2) + ("t",) not in markers
+    assert_sound(
+        b, c, "A",
+        ["a", "t", "x", "y", "ns", "foo", "w-0", "ww-0"],
+        rounds=4000,
+    )
+
+
+
+# ---------------------------------------------------------------- HTTP 端到端
+
+def test_http_impact_self_dname_scenario():
+    # POST /impact 在自引用 DNAME 场景下必须正常返回（旧实现无响应）；
+    # 见证应答与 POST /resolve 逐字段一致；31 层变化、32 层不报；
+    # 非法区域仍整单 400。
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    client = TestClient(app)
+    body = {
+        "origin": "example.",
+        "types": ["A"],
+        "baseline": (
+            "$ORIGIN example.\n$TTL 3600\n"
+            "@ SOA ns1 hm 1 7200 3600 1209600 60\n NS ns1\n"
+            "ns1 A 192.0.2.1\nx.d DNAME d\na.d A 192.0.2.10\n"
+        ),
+        "candidate": (
+            "$ORIGIN example.\n$TTL 3600\n"
+            "@ SOA ns1 hm 2 7200 3600 1209600 60\n NS ns1\n"
+            "ns1 A 192.0.2.1\nx.d DNAME d\na.d A 192.0.2.20\n"
+        ),
+    }
+    r = client.post("/impact", json=body)
+    assert r.status_code == 200
+    out = r.json()
+    assert out["type_summary"] == [
+        {"type": "A", "changed_cells": 32, "patterns": 32}]
+    patterns = out["patterns"]
+    assert len(patterns) == 32
+
+    # 0 跳与 31 跳见证与 /resolve 逐字段一致。
+    for k in (0, 31):
+        name = "a." + "x." * k + "d"
+        rr = client.post("/resolve", json={
+            "origin": "example.", "name": name, "type": "A",
+            "baseline": body["baseline"], "candidate": body["candidate"],
+        })
+        assert rr.status_code == 200
+        ro = rr.json()
+        assert ro["identical"] is False
+        p = next(p for p in patterns if p["scope"]["selector"] == name)
+        assert p["baseline"] == ro["baseline"]
+        assert p["candidate"] == ro["candidate"]
+
+    # 32 层：两版 alias_chain_limit、identical，且不在任何模式中。
+    name32 = "a." + "x." * 32 + "d"
+    rr = client.post("/resolve", json={
+        "origin": "example.", "name": name32, "type": "A",
+        "baseline": body["baseline"], "candidate": body["candidate"],
+    })
+    ro = rr.json()
+    assert ro["identical"] is True
+    assert ro["baseline"]["termination"] == "alias_chain_limit"
+    assert ro["candidate"]["termination"] == "alias_chain_limit"
+    assert len(ro["baseline"]["alias_chain"]) == MAX_ALIAS_HOPS
+    assert all(p["scope"]["selector"] != name32 for p in patterns)
+
+    # 非法区域（外部 CNAME 目标）整单 400。
+    bad = dict(body, baseline=body["baseline"] + "www CNAME ext.out.\n")
+    r = client.post("/impact", json=bad)
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "invalid_zone"
+
+    # 越区查询名 400。
+    r = client.post("/resolve", json={
+        "origin": "example.", "name": "a.d.other.", "type": "A",
+        "baseline": body["baseline"], "candidate": body["candidate"],
+    })
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "out_of_zone"
 
 
 if __name__ == "__main__":

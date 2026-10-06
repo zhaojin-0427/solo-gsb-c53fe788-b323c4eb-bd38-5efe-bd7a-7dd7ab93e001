@@ -11,7 +11,11 @@
 
 * 两版区域的全部真实属主、通配符父节点、空非终结点都作为标记；
 * DNAME 目标子树的结构点通过拉回（preimage）闭包映射回源侧，
-  因此 DNAME 目标变化影响到的未列名也会被覆盖；
+  因此 DNAME 目标变化影响到的未列名也会被覆盖；闭包**按实际跳数
+  有限化**（深度上限 ``MAX_ALIAS_HOPS - 1``）：一次拉回对应正向解析的
+  一跳 DNAME 改写，像 ``x.d DNAME d`` 这类自引用规则只生成有限个
+  x.d / x.x.d / … 标记，不会无限增长，且边界与解析器一致——31 跳仍可
+  见末端变化，32 跳触顶（alias_chain_limit）后两版应答相同；
 * trie 上每个标记节点的直接下级空隙用 ``w-*``（一标签）与
   ``ww-*``（多层）两个虚拟标签代表。
 
@@ -25,7 +29,15 @@ import dns.name
 import dns.rdatatype
 
 from .zone import ParsedZone
-from .resolver import Resolver, Answer
+from .resolver import Resolver, Answer, MAX_ALIAS_HOPS
+
+# 反向拉回（preimage）的最大深度：一次拉回对应正向解析里的一跳 DNAME
+# 改写。解析器在第 MAX_ALIAS_HOPS 跳处以 alias_chain_limit 终止，末端
+# 数据不再可见；因此只需把“经不超过 MAX_ALIAS_HOPS-1 跳改写即可到达
+# 末端结构点”的源侧名称拉成显式标记。再深的名称两版都在跳数上限处
+# 终止，其变化判定由既有探针空隙承载——这与 /resolve 的逐跳结果一致：
+# 31 层 x 仍能看到目标变化，32 层触顶后两版应答相同。
+MAX_PREIMAGE_DEPTH = MAX_ALIAS_HOPS - 1
 
 # ---------------------------------------------------------------------------
 # 锥与模式
@@ -112,17 +124,30 @@ def build_markers(
     markers = _collect_owner_labels(base, origin) | _collect_owner_labels(cand, origin)
 
     # DNAME 拉回闭包：两版区域里任一 DNAME 规则都要作用于当前全部标记，
-    # 直到不动点。这样无论变化在源侧还是目标侧，受影响的未列名都会落进
-    # 某个显式单元，而不是只被深层虚拟探针笼统覆盖。
+    # 直到深度达到 MAX_PREIMAGE_DEPTH。这样无论变化在源侧还是目标侧，受
+    # 影响的未列名都会落进某个显式单元，而不是只被深层虚拟探针笼统覆盖。
+    #
+    # 关键：闭包必须**按实际跳数有限化**。像 ``x.d DNAME d`` 这类自引用
+    # 规则会把目标侧标记 d 拉成 x.d，再拉成 x.x.d……若无深度限制便无限
+    # 生成（旧实现的不动点循环在此直接挂死）。每个标记记录其“经多少跳
+    # DNAME 反向改写得到”的最短距离：属主/通配父节点为 0，每做一次拉回
+    # 距离 +1；距离已达 MAX_PREIMAGE_DEPTH 的标记不再继续拉回——由它再
+    # 拉回得到的名字正向解析时至少需要 MAX_ALIAS_HOPS 跳，必在跳数上限
+    # 处终止，两版末端数据都不可见（与 /resolve 一致），其变化与否由其
+    # 所属的 star/deep 探针空隙代表。
     rules = list(_dname_rules(base, origin)) + list(_dname_rules(cand, origin))
 
-    changed = True
-    while changed:
-        changed = False
+    # dist[m] = m 距最近 0 层标记的最短反向改写跳数。
+    dist: dict[tuple[str, ...], int] = {m: 0 for m in markers}
+    frontier = set(markers)
+    for _depth in range(MAX_PREIMAGE_DEPTH):
+        if not frontier:
+            break
+        new_frontier: set[tuple[str, ...]] = set()
         for src, tgt in rules:
             wildcard_dname = bool(src) and src[0] == "*"
             owner_parent = src[1:] if wildcard_dname else src
-            for m in list(markers):
+            for m in frontier:
                 if m == tgt:
                     rel: tuple[str, ...] = ()
                 elif len(m) > len(tgt) and m[-len(tgt):] == tgt:
@@ -138,9 +163,11 @@ def build_markers(
                     new = rel + owner_parent
                 else:
                     new = rel + src
-                if new not in markers:
+                if new not in dist:
+                    dist[new] = _depth + 1
                     markers.add(new)
-                    changed = True
+                    new_frontier.add(new)
+        frontier = new_frontier
 
     # trie 前缀闭合。
     for m in list(markers):

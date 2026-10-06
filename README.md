@@ -48,9 +48,16 @@ BIND 文本（基线 `baseline` 与候选 `candidate`），枚举**域内所有�
   包围名是 `leaf.e` 而非顶点，`*.e` / 顶点 `*` 一律不再扩展 → NXDOMAIN。
 * **CNAME / DNAME 逐跳重判**；DNAME 按 RFC 6672 在应答里合成一条 CNAME
   （合成 CNAME 在前、真实 DNAME 在后）。通配符 DNAME 也支持。
+* **别名链跳数上限为 32 跳**（`MAX_ALIAS_HOPS`）：第 32 跳以
+  `alias_chain_limit` 终止，末端数据不再可见；环以 `alias_loop` 终止。
 * **DNAME 目标子树变化影响的“未列名”会被覆盖**：目标子树里的结构点会通过
   拉回（preimage）闭包映射回 DNAME 源侧，因此新增 `a.b.dt` 之类的变化会
-  产生 `a.b.d` 等模式，而不会漏报。
+  产生 `a.b.d` 等模式，而不会漏报。拉回深度**按实际跳数有限化**——一次拉回
+  对应正向解析的一跳 DNAME 改写，闭包只生成“不超过 31 跳即可到达末端结构
+  点”的源侧名称；再深的名字两版都在跳数上限处终止。这样即使区域里有
+  `x.d DNAME d` 这种**自引用 DNAME**，闭包也只生成有限个 `x.d / x.x.d /
+  … / x³¹.d` 标记（旧实现的无界不动点会在此无限生成、令 `/impact` 无响应），
+  且边界与 `/resolve` 完全一致：31 层 `x` 的变化仍上报，32 层触顶后不报。
 
 ### 变更模式选择子（selector）
 
@@ -237,6 +244,574 @@ leaf.e         wildcard_expansion -> exact            # 精确名压过通配
   的最近包围名是 `leaf.e`，上层 `*.e` 被阻断，仍为 NXDOMAIN。
 * 只有“应答真的变化”的名字才进入模式集合；通配 / DNAME 覆盖的未列名区域
   用 `*.prefix` / `**.prefix` 表达，并在 `exclude` 中挖掉应答未变的已列名点。
+### 自引用 DNAME 与跳数上限：`x.d DNAME d`（/impact 有限化）
+
+区域里出现自引用 DNAME `x.d DNAME d` 时，查询
+`a.x.d → a.x.x.d → a.x.x.x.d → …` 会沿着同一条 DNAME 规则逐跳改写。
+下面两版区域只改了末端 `a.d` 的 A 地址（`192.0.2.10 → 192.0.2.20`）：
+
+```bash
+curl -sS http://localhost:8080/impact \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "origin": "example.",
+    "types": ["A"],
+    "baseline": "$ORIGIN example.\n$TTL 3600\n@ SOA ns1 hm 1 7200 3600 1209600 60\n NS ns1\nns1 A 192.0.2.1\nx.d DNAME d\na.d A 192.0.2.10\n",
+    "candidate": "$ORIGIN example.\n$TTL 3600\n@ SOA ns1 hm 2 7200 3600 1209600 60\n NS ns1\nns1 A 192.0.2.1\nx.d DNAME d\na.d A 192.0.2.20\n"
+  }'
+```
+
+反向拉回闭包按**实际跳数**有限化：`a.d`（0 跳）、`a.x.d`（1 跳）、……、
+连续 31 层 `x` 的名字（31 跳）各产生一个精确模式——它们在 32 跳上限
+**之前**仍能取到 `a.d` 变化后的 A；连续 32 层 `x` 及更深的名字两版都在
+第 32 跳处以 `alias_chain_limit` 终止，末端 A 不可见，因此**不**产生模式，
+也不会被误报。响应恰好 32 个模式（服务按先深后浅排序，最深的
+`a.x³¹.d` 在 `patterns` 数组首位、`a.d` 在末尾）。下面是该请求的**真实
+响应**，为便于叙述按 0 跳、1 跳、31 跳的顺序摘出三个见证（完整保留
+0 跳与 1 跳两个模式；31 跳模式的长链只列真实的首/尾条目，重复部分用
+`_note` / `_records_note` 键注明真实条数与内容——这些键仅为本文档可读性
+加入，实际响应里是完整展开的记录）：
+
+```json
+{
+  "origin": "example.",
+  "compared_types": [
+    "A"
+  ],
+  "coverage": {
+    "probe_cells_per_type": 201,
+    "changed_cells_total": 32,
+    "note": "probe_cells_per_type 个等价类覆盖域内全部名称；每个模式的 scope 减去 exclude 后两两互斥且并集恰为变更集。"
+  },
+  "type_summary": [
+    {
+      "type": "A",
+      "changed_cells": 32,
+      "patterns": 32
+    }
+  ],
+  "patterns": [
+    {
+      "scope": {
+        "selector": "a.d",
+        "kind": "exact",
+        "name": "a.d"
+      },
+      "exclude": [],
+      "witness": {
+        "name": "a.d",
+        "probe_kind": "exact"
+      },
+      "baseline": {
+        "qname": "a.d",
+        "qtype": "A",
+        "rcode": "NOERROR",
+        "aa": true,
+        "termination": "exact",
+        "answer": [
+          {
+            "name": "a.d",
+            "type": "A",
+            "ttl": 3600,
+            "records": [
+              {
+                "address": "192.0.2.10"
+              }
+            ]
+          }
+        ],
+        "authority": [],
+        "additional": [],
+        "wildcard_source": null,
+        "dname_encloser": null,
+        "alias_chain": []
+      },
+      "candidate": {
+        "qname": "a.d",
+        "qtype": "A",
+        "rcode": "NOERROR",
+        "aa": true,
+        "termination": "exact",
+        "answer": [
+          {
+            "name": "a.d",
+            "type": "A",
+            "ttl": 3600,
+            "records": [
+              {
+                "address": "192.0.2.20"
+              }
+            ]
+          }
+        ],
+        "authority": [],
+        "additional": [],
+        "wildcard_source": null,
+        "dname_encloser": null,
+        "alias_chain": []
+      },
+      "types": [
+        "A"
+      ]
+    },
+    {
+      "scope": {
+        "selector": "a.x.d",
+        "kind": "exact",
+        "name": "a.x.d"
+      },
+      "exclude": [],
+      "witness": {
+        "name": "a.x.d",
+        "probe_kind": "exact"
+      },
+      "baseline": {
+        "qname": "a.x.d",
+        "qtype": "A",
+        "rcode": "NOERROR",
+        "aa": true,
+        "termination": "exact",
+        "answer": [
+          {
+            "name": "a.x.d",
+            "type": "CNAME",
+            "ttl": 3600,
+            "records": [
+              {
+                "target": "a.d.example."
+              }
+            ]
+          },
+          {
+            "name": "x.d",
+            "type": "DNAME",
+            "ttl": 3600,
+            "records": [
+              {
+                "target": "d.example."
+              }
+            ]
+          },
+          {
+            "name": "a.d",
+            "type": "A",
+            "ttl": 3600,
+            "records": [
+              {
+                "address": "192.0.2.10"
+              }
+            ]
+          }
+        ],
+        "authority": [],
+        "additional": [],
+        "wildcard_source": null,
+        "dname_encloser": "x.d",
+        "alias_chain": [
+          {
+            "kind": "DNAME",
+            "owner": "x.d",
+            "target": "a.d.example.",
+            "presented_cname_owner": "a.x.d"
+          }
+        ]
+      },
+      "candidate": {
+        "qname": "a.x.d",
+        "qtype": "A",
+        "rcode": "NOERROR",
+        "aa": true,
+        "termination": "exact",
+        "answer": [
+          {
+            "name": "a.x.d",
+            "type": "CNAME",
+            "ttl": 3600,
+            "records": [
+              {
+                "target": "a.d.example."
+              }
+            ]
+          },
+          {
+            "name": "x.d",
+            "type": "DNAME",
+            "ttl": 3600,
+            "records": [
+              {
+                "target": "d.example."
+              }
+            ]
+          },
+          {
+            "name": "a.d",
+            "type": "A",
+            "ttl": 3600,
+            "records": [
+              {
+                "address": "192.0.2.20"
+              }
+            ]
+          }
+        ],
+        "authority": [],
+        "additional": [],
+        "wildcard_source": null,
+        "dname_encloser": "x.d",
+        "alias_chain": [
+          {
+            "kind": "DNAME",
+            "owner": "x.d",
+            "target": "a.d.example.",
+            "presented_cname_owner": "a.x.d"
+          }
+        ]
+      },
+      "types": [
+        "A"
+      ]
+    },
+    {
+      "scope": {
+        "selector": "a.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.d",
+        "kind": "exact",
+        "name": "a.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.d"
+      },
+      "exclude": [],
+      "witness": {
+        "name": "a.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.d",
+        "probe_kind": "exact"
+      },
+      "baseline": {
+        "qname": "a.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.d",
+        "qtype": "A",
+        "rcode": "NOERROR",
+        "aa": true,
+        "termination": "exact",
+        "answer": [
+          {
+            "name": "a.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.d",
+            "type": "CNAME",
+            "ttl": 3600,
+            "records": [
+              {
+                "target": "a.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.d.example."
+              }
+            ]
+          },
+          {
+            "name": "x.d",
+            "type": "DNAME",
+            "ttl": 3600,
+            "records": [
+              {
+                "target": "d.example."
+              }
+            ],
+            "_records_note": "真实应答中此 DNAME RRset 含 31 条完全相同的 {\"target\":\"d.example.\"} 记录（每经过一跳 x.d DNAME d 就在 answer 里呈现一次；此处为可读只列 1 条）。"
+          },
+          {
+            "_note": "…其后是 30 条后续跳的合成 CNAME（无 DNAME），首/尾两条为：…"
+          },
+          {
+            "name": "a.x.d",
+            "type": "CNAME",
+            "ttl": 3600,
+            "records": [
+              {
+                "target": "a.d.example."
+              }
+            ]
+          },
+          {
+            "_note": "…中间 28 条：属主从 a.x^29.d 逐层到 a.x^2.d，target 各少一层 x…"
+          },
+          {
+            "name": "a.d",
+            "type": "A",
+            "ttl": 3600,
+            "records": [
+              {
+                "address": "192.0.2.10"
+              }
+            ]
+          }
+        ],
+        "authority": [],
+        "additional": [],
+        "wildcard_source": null,
+        "dname_encloser": "x.d",
+        "alias_chain": [
+          {
+            "kind": "DNAME",
+            "owner": "x.d",
+            "target": "a.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.d.example.",
+            "presented_cname_owner": "a.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.d"
+          },
+          {
+            "_note": "真实 alias_chain 共 31 个元素，均为 {kind:\"DNAME\", owner:\"x.d\"}；target 依次为 a.x^30.d.example., a.x^29.d.example., …, a.d.example.，presented_cname_owner 依次为 a.x^31.d, a.x^30.d, …, a.x.d。"
+          },
+          {
+            "kind": "DNAME",
+            "owner": "x.d",
+            "target": "a.d.example.",
+            "presented_cname_owner": "a.x.d"
+          }
+        ]
+      },
+      "candidate": {
+        "qname": "a.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.d",
+        "qtype": "A",
+        "rcode": "NOERROR",
+        "aa": true,
+        "termination": "exact",
+        "answer": [
+          {
+            "name": "a.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.d",
+            "type": "CNAME",
+            "ttl": 3600,
+            "records": [
+              {
+                "target": "a.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.d.example."
+              }
+            ]
+          },
+          {
+            "name": "x.d",
+            "type": "DNAME",
+            "ttl": 3600,
+            "records": [
+              {
+                "target": "d.example."
+              }
+            ],
+            "_records_note": "真实应答中此 DNAME RRset 含 31 条完全相同的 {\"target\":\"d.example.\"} 记录（每经过一跳 x.d DNAME d 就在 answer 里呈现一次；此处为可读只列 1 条）。"
+          },
+          {
+            "_note": "…其后是 30 条后续跳的合成 CNAME（无 DNAME），首/尾两条为：…"
+          },
+          {
+            "name": "a.x.d",
+            "type": "CNAME",
+            "ttl": 3600,
+            "records": [
+              {
+                "target": "a.d.example."
+              }
+            ]
+          },
+          {
+            "_note": "…中间 28 条：属主从 a.x^29.d 逐层到 a.x^2.d，target 各少一层 x…"
+          },
+          {
+            "name": "a.d",
+            "type": "A",
+            "ttl": 3600,
+            "records": [
+              {
+                "address": "192.0.2.20"
+              }
+            ]
+          }
+        ],
+        "authority": [],
+        "additional": [],
+        "wildcard_source": null,
+        "dname_encloser": "x.d",
+        "alias_chain": [
+          {
+            "kind": "DNAME",
+            "owner": "x.d",
+            "target": "a.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.d.example.",
+            "presented_cname_owner": "a.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.d"
+          },
+          {
+            "_note": "真实 alias_chain 共 31 个元素，均为 {kind:\"DNAME\", owner:\"x.d\"}；target 依次为 a.x^30.d.example., a.x^29.d.example., …, a.d.example.，presented_cname_owner 依次为 a.x^31.d, a.x^30.d, …, a.x.d。"
+          },
+          {
+            "kind": "DNAME",
+            "owner": "x.d",
+            "target": "a.d.example.",
+            "presented_cname_owner": "a.x.d"
+          }
+        ]
+      }
+    }
+  ],
+  "_patterns_note": "patterns 数组实际含 32 个模式，服务按先深后浅排序（数组首位即 31 跳的 a.x^31.d，末尾是 a.d）；为便于叙述此处按 0 跳(a.d)、1 跳(a.x.d)、31 跳(a.x^31.d) 的顺序摘出三个，中间 a.x^2.d … a.x^30.d 等 29 个结构与 31 跳模式相同而跳数递减。"
+}
+```
+
+用 `/resolve` 直接核对边界（连续 31 层 `x` 仍变化；32 层触顶后两版一致）：
+
+```bash
+# 31 层 x：identical=false，两边都 31 跳、termination=exact，末端 A 不同
+curl -sS http://localhost:8080/resolve -H 'Content-Type: application/json' -d '{
+  "origin": "example.", "type": "A",
+  "name": "a.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.d",
+  "baseline": "$ORIGIN example.\n$TTL 3600\n@ SOA ns1 hm 1 7200 3600 1209600 60\n NS ns1\nns1 A 192.0.2.1\nx.d DNAME d\na.d A 192.0.2.10\n",
+  "candidate": "$ORIGIN example.\n$TTL 3600\n@ SOA ns1 hm 2 7200 3600 1209600 60\n NS ns1\nns1 A 192.0.2.1\nx.d DNAME d\na.d A 192.0.2.20\n"
+}'
+# => "identical": false；baseline/candidate 的 termination 均为 "exact"，
+#    alias_chain 各 31 个 DNAME 跳，answer 末端 A 分别为 .10 / .20
+
+# 32 层 x：identical=true，两边均在第 32 跳终止
+curl -sS http://localhost:8080/resolve -H 'Content-Type: application/json' -d '{
+  "origin": "example.", "type": "A",
+  "name": "a.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.d",
+  "baseline": "$ORIGIN example.\n$TTL 3600\n@ SOA ns1 hm 1 7200 3600 1209600 60\n NS ns1\nns1 A 192.0.2.1\nx.d DNAME d\na.d A 192.0.2.10\n",
+  "candidate": "$ORIGIN example.\n$TTL 3600\n@ SOA ns1 hm 2 7200 3600 1209600 60\n NS ns1\nns1 A 192.0.2.1\nx.d DNAME d\na.d A 192.0.2.20\n"
+}'
+```
+
+第二请求的**真实响应**（同样用 `_note` 键折叠长链；实际响应完整展开）：
+两边都是 32 跳 `alias_chain_limit`，answer 里只有逐跳的“合成 CNAME +
+DNAME”，**没有**末端 A，因此 `identical` 为 `true`，该名字不属于任何模式：
+
+```json
+{
+  "origin": "example.",
+  "qname": "a.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.d",
+  "qtype": "A",
+  "identical": true,
+  "baseline": {
+    "qname": "a.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.d",
+    "qtype": "A",
+    "rcode": "NOERROR",
+    "aa": true,
+    "termination": "alias_chain_limit",
+    "answer": [
+      {
+        "name": "a.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.d",
+        "type": "CNAME",
+        "ttl": 3600,
+        "records": [
+          {
+            "target": "a.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.d.example."
+          }
+        ]
+      },
+      {
+        "name": "x.d",
+        "type": "DNAME",
+        "ttl": 3600,
+        "records": [
+          {
+            "target": "d.example."
+          }
+        ],
+        "_records_note": "真实应答中此 DNAME RRset 含 32 条完全相同的 {\"target\":\"d.example.\"} 记录（每经过一跳 x.d DNAME d 就在 answer 里呈现一次；此处为可读只列 1 条）。"
+      },
+      {
+        "_note": "…其后是 31 条后续跳的合成 CNAME，最后一条为：…"
+      },
+      {
+        "name": "a.x.d",
+        "type": "CNAME",
+        "ttl": 3600,
+        "records": [
+          {
+            "target": "a.d.example."
+          }
+        ]
+      },
+      {
+        "_note": "链在第 32 跳终止；answer 到此结束，没有末端 a.d 的 A RRset。"
+      }
+    ],
+    "authority": [],
+    "additional": [],
+    "wildcard_source": null,
+    "dname_encloser": "x.d",
+    "alias_chain": [
+      {
+        "kind": "DNAME",
+        "owner": "x.d",
+        "target": "a.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.d.example.",
+        "presented_cname_owner": "a.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.d"
+      },
+      {
+        "_note": "真实 alias_chain 共 32 个 DNAME 跳；第 32 跳 target 为 a.d.example.，resolver 在跳数上限处终止，不再查询 a.d。"
+      }
+    ]
+  },
+  "candidate": {
+    "qname": "a.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.d",
+    "qtype": "A",
+    "rcode": "NOERROR",
+    "aa": true,
+    "termination": "alias_chain_limit",
+    "answer": [
+      {
+        "name": "a.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.d",
+        "type": "CNAME",
+        "ttl": 3600,
+        "records": [
+          {
+            "target": "a.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.d.example."
+          }
+        ]
+      },
+      {
+        "name": "x.d",
+        "type": "DNAME",
+        "ttl": 3600,
+        "records": [
+          {
+            "target": "d.example."
+          }
+        ],
+        "_records_note": "真实应答中此 DNAME RRset 含 32 条完全相同的 {\"target\":\"d.example.\"} 记录（每经过一跳 x.d DNAME d 就在 answer 里呈现一次；此处为可读只列 1 条）。"
+      },
+      {
+        "_note": "…其后是 31 条后续跳的合成 CNAME，最后一条为：…"
+      },
+      {
+        "name": "a.x.d",
+        "type": "CNAME",
+        "ttl": 3600,
+        "records": [
+          {
+            "target": "a.d.example."
+          }
+        ]
+      },
+      {
+        "_note": "链在第 32 跳终止；answer 到此结束，没有末端 a.d 的 A RRset。"
+      }
+    ],
+    "authority": [],
+    "additional": [],
+    "wildcard_source": null,
+    "dname_encloser": "x.d",
+    "alias_chain": [
+      {
+        "kind": "DNAME",
+        "owner": "x.d",
+        "target": "a.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.d.example.",
+        "presented_cname_owner": "a.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.d"
+      },
+      {
+        "_note": "真实 alias_chain 共 32 个 DNAME 跳；第 32 跳 target 为 a.d.example.，resolver 在跳数上限处终止，不再查询 a.d。"
+      }
+    ]
+  }
+}
+```
+
+要点：
+
+* 反向拉回深度上限 = `MAX_ALIAS_HOPS - 1`（31）：标记只覆盖“上限前还能
+  看见末端”的名字，既不漏掉 31 层（含）以内的变化，也不把 32 层（含）
+  以后触顶的名字误报；`/impact` 的每个见证应答都与 `/resolve` 对同一名字
+  的应答逐字段相同（测试中有逐字段断言）。
+* 只在一版出现的自引用 DNAME（如候选新增 `x.t DNAME t`）同样有限化：
+  基线 `nxdomain` 与候选别名链/命中之间的真实变化由深度 0–31 的探针及其
+  `*.…` / `**.…` 空隙模式承载，性质校验（变化名恰入一个模式、未变化名
+  不入任何模式）在数万随机深名上通过。
+* 非法语法、越区属主、外部 CNAME/NS/DNAME 目标等仍按整单 `400` 拒绝，
+  与区域是否含自引用 DNAME 无关。
+
 
 ### 委派 / 通配 / DNAME 的应答长什么样
 
@@ -322,7 +897,7 @@ curl -sS http://localhost:8080/resolve \
 app/
   zone.py       # BIND 逐记录解析 + 越区/外部引用/委派校验；构建空非终结点/通配父节点集合
   resolver.py   # 离线权威解析：切点、最近包围名（含 ENT/通配父）、通配与 DNAME 合成、别名逐跳
-  diff.py       # 标记 trie、DNAME 拉回闭包、探针分区、未列名空洞排除与互斥完备模式归并
+  diff.py       # 标记 trie、按跳数有限化的 DNAME 拉回闭包（上限 31 跳）、探针分区、未列名空洞排除与互斥完备模式归并
   serial.py     # Answer / Pattern 的 JSON 序列化
   main.py       # FastAPI：POST /impact、POST /resolve、GET /healthz
 tests/
