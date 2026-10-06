@@ -262,14 +262,14 @@ def _in_pattern(labels, p):
     )
 
 
-def assert_sound(b, c, qtype, vocab, rounds=3000):
+def assert_sound(b, c, qtype, vocab, rounds=3000, max_depth=5):
     rb, rc = res(b), res(c)
     qt = dns.rdatatype.from_text(qtype)
     patterns = analyze(b, c, [qt])[0].patterns
     random.seed(7)
     for _ in range(rounds):
         labs = tuple(random.choice(vocab)
-                     for _ in range(random.randint(0, 5)))
+                     for _ in range(random.randint(0, max_depth)))
         qn = abs_name(labs, b.origin)
         changed = answer_signature(rb.resolve(qn, qt)) != answer_signature(
             rc.resolve(qn, qt))
@@ -421,6 +421,78 @@ def test_dname_target_deep_unlisted_covered():
     scopes = {p.scope.render()
               for p in analyze(b, c, [dns.rdatatype.A])[0].patterns}
     assert "a.b.d" in scopes and "a.b.dt" in scopes
+
+
+def test_dname_self_reference_closure_is_hop_bounded():
+    # x.d DNAME d 是自引用规则：朴素拉回闭包会无限生成 x.d、x.x.d……，
+    # 使 POST /impact 无响应。闭包必须按解析器的实际别名跳数有限化：
+    # 拉回点 a.x^k.d 对应 k 跳，k < 32 的变化要进模式，k == 32 撞上
+    # alias_chain_limit（两版相同）后不得误报。
+    from app.resolver import MAX_ALIAS_HOPS
+    hdr = ("$ORIGIN ex.\n$TTL 60\n@ SOA ns hm {sn} 1 1 1 1\n NS ns\n"
+           "ns A 192.0.2.1\nx.d DNAME d\n")
+    b = parse_zone(hdr.format(sn=1) + "a.d A 192.0.2.5\n",
+                   ORIGIN, label="b")
+    c = parse_zone(hdr.format(sn=2) + "a.d A 192.0.2.6\n",
+                   ORIGIN, label="c")
+
+    # 闭包必须终止（曾在此无限循环）。
+    qt = dns.rdatatype.A
+    td = analyze(b, c, [qt])[0]
+    scopes = {p.scope.render() for p in td.patterns}
+
+    rb, rc = Resolver(b), Resolver(c)
+
+    def changed(k):
+        qn = dns.name.from_text("a." + "x." * k + "d", origin=b.origin)
+        return answer_signature(rb.resolve(qn, qt)) != answer_signature(
+            rc.resolve(qn, qt))
+
+    # a.d 本身 + 1..31 跳的拉回名恰好各一个精确模式；共 32 个。
+    assert len(td.patterns) == MAX_ALIAS_HOPS
+    for k in range(0, MAX_ALIAS_HOPS):
+        sel = "a." + "x." * k + "d"
+        assert changed(k) and sel in scopes, k
+    # 32 跳及以上：两版都在拿到末端 A 前终止于 alias_chain_limit → 无变化。
+    for k in range(MAX_ALIAS_HOPS, MAX_ALIAS_HOPS + 5):
+        sel = "a." + "x." * k + "d"
+        assert not changed(k) and sel not in scopes, k
+    # 不经过 a.d 的名字（x^k.d、y.x^k.d）两版相同，不进任何模式；
+    # 抽上限前后的代表点即可。
+    for k in (0, 1, 2, 30, 31, 32, 33):
+        for pref in ((), ("y",)):
+            labs = pref + ("x",) * k + ("d",)
+            qn = abs_name(labs, b.origin)
+            assert answer_signature(rb.resolve(qn, qt)) == answer_signature(
+                rc.resolve(qn, qt)), labs
+    # 见证应答就是两版 /resolve 对见证名的应答（合成 CNAME 在前、真实
+    # DNAME 在后；末端为各自的 a.d A）。
+    p1 = next(p for p in td.patterns if p.scope.render() == "a.x.d")
+    assert len(p1.baseline.hops) == 1
+    assert p1.baseline.answer[0].rdtype == dns.rdatatype.CNAME
+    assert p1.baseline.answer[1].rdtype == dns.rdatatype.DNAME
+    assert p1.baseline.answer[-1].rdata.address == "192.0.2.5"
+    assert p1.candidate.answer[-1].rdata.address == "192.0.2.6"
+    assert p1.baseline.termination == p1.candidate.termination == "exact"
+    p31 = next(p for p in td.patterns
+               if p.scope.render() == "a." + "x." * 31 + "d")
+    assert len(p31.baseline.hops) == 31
+    # DNAME 记录本身两版相同，故 DNAME 类型查询无模式（其末端不依赖 a.d
+    # 的 A 地址）。
+    assert analyze(b, c, [dns.rdatatype.DNAME])[0].patterns == []
+    # 模式集合对全部名字互斥完备：除系统性的 a.x^k.d 链外，再核对若干跨
+    # 上限的其他深度名（未变化者不得落入任何模式）。
+    for labs in (
+        ("x",) * 40 + ("d",), ("y",) + ("x",) * 40 + ("d",),
+        ("a", "x") * 20 + ("d",), ("w-3", "a") + ("x",) * 35 + ("d",),
+        ("ww-2", "w-1", "a") + ("x",) * 33 + ("d",),
+    ):
+        qn = abs_name(labs, b.origin)
+        members = [p for p in td.patterns if _in_pattern(labs, p)]
+        changed = answer_signature(rb.resolve(qn, qt)) != answer_signature(
+            rc.resolve(qn, qt))
+        assert (len(members) == 1) == changed, labs
+        assert bool(members) == changed, labs
 
 
 def test_identical_zones_no_patterns():

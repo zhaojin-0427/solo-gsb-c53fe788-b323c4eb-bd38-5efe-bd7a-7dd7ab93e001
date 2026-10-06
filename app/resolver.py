@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 import dns.name
 import dns.rdataclass
 import dns.rdatatype
-import dns.rdata
+import dns.rdtypes.ANY.CNAME
 
 from .zone import ParsedZone, RR
 
@@ -48,6 +48,9 @@ class Hop:
     cname_owner: dns.name.Name    # 线上应答里 CNAME 的属主（DNAME 时为合成名）
     cname_rr: RR | None = None    # 真实 CNAME RR；DNAME 合成时为 None
     dname_rr: RR | None = None    # 真实（或按 RFC6672 呈现的）DNAME RR
+    # 本跳在线上应答里呈现的合成 CNAME RR（DNAME 合成或通配 CNAME 时缓存，
+    # 避免 _lookup 与 _chain_answer 各构造一次）。
+    presented_cname_rr: RR | None = None
 
 
 @dataclass
@@ -99,8 +102,10 @@ class Resolver:
 
     def _make_cname_rr(self, owner: dns.name.Name,
                        target: dns.name.Name, ttl: int) -> RR:
-        rdata = dns.rdata.from_text(
-            dns.rdataclass.IN, dns.rdatatype.CNAME, target.to_text()
+        rdata = dns.rdtypes.ANY.CNAME.CNAME(
+            rdclass=dns.rdataclass.IN,
+            rdtype=dns.rdatatype.CNAME,
+            target=target,
         )
         return RR(owner=owner, rdtype=dns.rdatatype.CNAME,
                   ttl=ttl, rdata=rdata)
@@ -194,6 +199,7 @@ class Resolver:
         hop = Hop(
             kind="WILDCARD_DNAME", owner=wildcard_name, target=new_name,
             cname_owner=qname, dname_rr=presented_dname,
+            presented_cname_rr=synth_cname,
         )
         ans = Answer(
             qname=qname, qtype=qtype, rcode="NOERROR", aa=True,
@@ -210,6 +216,7 @@ class Resolver:
         hop = Hop(
             kind="DNAME", owner=encloser, target=new_name,
             cname_owner=qname, dname_rr=dname_rr,
+            presented_cname_rr=synth_cname,
         )
         ans = Answer(
             qname=qname, qtype=qtype, rcode="NOERROR", aa=True,
@@ -278,6 +285,7 @@ class Resolver:
                     kind="WILDCARD_CNAME", owner=wildcard_name,
                     target=cname_rr.rdata.target,
                     cname_owner=qname, cname_rr=cname_rr,
+                    presented_cname_rr=synthetic,
                 )
                 ans = Answer(
                     qname=qname, qtype=qtype, rcode="NOERROR", aa=True,
@@ -422,11 +430,12 @@ class Resolver:
             if hop.kind in ("CNAME",):
                 answer.append(hop.cname_rr)
             elif hop.kind == "WILDCARD_CNAME":
-                answer.append(self._make_cname_rr(
+                # 合成 CNAME 已在 _lookup 中按 qname 属主构造，直接复用。
+                answer.append(hop.presented_cname_rr or self._make_cname_rr(
                     hop.cname_owner, hop.target, hop.cname_rr.ttl
                 ))
             else:  # DNAME / WILDCARD_DNAME：线上为 [合成 CNAME, DNAME]
-                answer.append(self._make_cname_rr(
+                answer.append(hop.presented_cname_rr or self._make_cname_rr(
                     hop.cname_owner, hop.target, hop.dname_rr.ttl
                 ))
                 answer.append(hop.dname_rr)

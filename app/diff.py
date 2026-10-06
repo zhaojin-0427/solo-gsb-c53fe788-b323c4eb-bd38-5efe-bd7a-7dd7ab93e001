@@ -11,7 +11,10 @@
 
 * 两版区域的全部真实属主、通配符父节点、空非终结点都作为标记；
 * DNAME 目标子树的结构点通过拉回（preimage）闭包映射回源侧，
-  因此 DNAME 目标变化影响到的未列名也会被覆盖；
+  因此 DNAME 目标变化影响到的未列名也会被覆盖；拉回按解析器的
+  实际别名跳数有限化：每条拉回记一跳，只保留少于
+  ``MAX_ALIAS_HOPS``（32）跳可达的点——自引用 DNAME（``x.d DNAME d``）
+  因此只生成到 ``x^31.d``，撞上限后的名字不由显式标记承载；
 * trie 上每个标记节点的直接下级空隙用 ``w-*``（一标签）与
   ``ww-*``（多层）两个虚拟标签代表。
 
@@ -19,13 +22,14 @@
 """
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 
 import dns.name
 import dns.rdatatype
 
 from .zone import ParsedZone
-from .resolver import Resolver, Answer
+from .resolver import Resolver, Answer, MAX_ALIAS_HOPS
 
 # ---------------------------------------------------------------------------
 # 锥与模式
@@ -111,36 +115,61 @@ def build_markers(
     origin = base.origin
     markers = _collect_owner_labels(base, origin) | _collect_owner_labels(cand, origin)
 
-    # DNAME 拉回闭包：两版区域里任一 DNAME 规则都要作用于当前全部标记，
-    # 直到不动点。这样无论变化在源侧还是目标侧，受影响的未列名都会落进
-    # 某个显式单元，而不是只被深层虚拟探针笼统覆盖。
+    # DNAME 拉回闭包（按解析器的实际跳数有限化）：两版区域里任一 DNAME
+    # 规则都作用于当前全部标记，直到不动点。这样无论变化在源侧还是目标侧，
+    # 受影响的未列名都会落进某个显式单元，而不是只被深层虚拟探针笼统覆盖。
+    #
+    # 关键：一次拉回对应解析器上的一跳别名改写，故给每个被拉回的标记记
+    # ``cost`` = 从该名字沿别名链走到其落点所需的最少跳数；只保留
+    # ``cost < MAX_ALIAS_HOPS`` 的拉回。``cost == MAX_ALIAS_HOPS`` 的名字在
+    # 两版解析中都在抵达末端数据前撞上限（termination 为
+    # alias_chain_limit，链上 RRs 由两版共同存在的 DNAME 自身决定），应答
+    # 不会因末端变化而不同，因此无需显式单元；再深层的名字由 trie 空隙的
+    # 多层虚拟探针（ww-*/w-*）统一代表。这样既不会漏掉上限前（cost
+    # 0..MAX_ALIAS_HOPS-1）的变化，也不会把上限后的名字误报。
+    #
+    # 自引用 DNAME（如 ``x.d DNAME d``）会让朴素闭包无限生成
+    # ``x.d``、``x.x.d``……；跳数有界后 BFS 必然终止（每个名字的代价取
+    # 0..MAX_ALIAS_HOPS-1，且只在首次得到更小代价时入队）。
     rules = list(_dname_rules(base, origin)) + list(_dname_rules(cand, origin))
 
-    changed = True
-    while changed:
-        changed = False
+    # 真实属主 / 通配父 / ENT 都是各自名字上的精确存在点：解析在该名即终止，
+    # 不再消耗别名跳，故初始代价为 0。
+    cost: dict[tuple[str, ...], int] = {m: 0 for m in markers}
+
+    # BFS：从代价 0 的种子出发，每条规则把每个标记拉回成源侧结构点；
+    # 每个名字只在其当前最小代价上出队一次。代价等于“从该名字沿别名链
+    # 走到落点”的最少跳数，边权全为 1，BFS 首次入队即最小代价。
+    queue = deque(cost)
+    while queue:
+        m = queue.popleft()
+        m_cost = cost[m]
+        next_cost = m_cost + 1
+        if next_cost >= MAX_ALIAS_HOPS:
+            # 更深的拉回只会更贵；上限后的名字两版都撞 alias_chain_limit。
+            continue
         for src, tgt in rules:
             wildcard_dname = bool(src) and src[0] == "*"
             owner_parent = src[1:] if wildcard_dname else src
-            for m in list(markers):
-                if m == tgt:
-                    rel: tuple[str, ...] = ()
-                elif len(m) > len(tgt) and m[-len(tgt):] == tgt:
-                    rel = m[: len(m) - len(tgt)]
-                else:
+            if m == tgt:
+                rel: tuple[str, ...] = ()
+            elif len(m) > len(tgt) and m[-len(tgt):] == tgt:
+                rel = m[: len(m) - len(tgt)]
+            else:
+                continue
+            if wildcard_dname:
+                if not rel:
+                    # 目标顶点 → 单层源名由 owner_parent 的 star 探针覆盖。
                     continue
-                if wildcard_dname:
-                    if not rel:
-                        # 目标顶点 → 单层源名由 owner_parent 的 star 探针覆盖。
-                        continue
-                    # rel=(y,...) 对应源侧 (任意x, y, ...)+owner_parent；
-                    # 加入剥离 x 后的结构点，使“x 之下”成为显式标记。
-                    new = rel + owner_parent
-                else:
-                    new = rel + src
-                if new not in markers:
-                    markers.add(new)
-                    changed = True
+                # rel=(y,...) 对应源侧 (任意x, y, ...)+owner_parent；
+                # 加入剥离 x 后的结构点，使“x 之下”成为显式标记。
+                new = rel + owner_parent
+            else:
+                new = rel + src
+            if next_cost < cost.get(new, MAX_ALIAS_HOPS):
+                cost[new] = next_cost
+                markers.add(new)
+                queue.append(new)
 
     # trie 前缀闭合。
     for m in list(markers):

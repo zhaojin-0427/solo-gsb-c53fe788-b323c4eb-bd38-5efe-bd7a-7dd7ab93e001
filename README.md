@@ -47,10 +47,16 @@ BIND 文本（基线 `baseline` 与候选 `candidate`），枚举**域内所有�
 * **更近的存在节点阻断上层通配**：若 `leaf.e` 存在，则 `x.leaf.e` 的最近
   包围名是 `leaf.e` 而非顶点，`*.e` / 顶点 `*` 一律不再扩展 → NXDOMAIN。
 * **CNAME / DNAME 逐跳重判**；DNAME 按 RFC 6672 在应答里合成一条 CNAME
-  （合成 CNAME 在前、真实 DNAME 在后）。通配符 DNAME 也支持。
+  （合成 CNAME 在前、真实 DNAME 在后）。通配符 DNAME 也支持。别名链最多
+  跟随 32 跳，超限后终止原因为 `alias_chain_limit`（只标记，非错误）。
 * **DNAME 目标子树变化影响的“未列名”会被覆盖**：目标子树里的结构点会通过
   拉回（preimage）闭包映射回 DNAME 源侧，因此新增 `a.b.dt` 之类的变化会
-  产生 `a.b.d` 等模式，而不会漏报。
+  产生 `a.b.d` 等模式，而不会漏报。拉回按解析器的**实际别名跳数有限化**：
+  每条拉回记一跳，只为“少于 32 跳可达落点”的名字建立显式单元。这样即便
+  区域含**自引用 DNAME**（如 `x.d DNAME d`，朴素闭包会无限生成
+  `x.d`、`x.x.d`……），`/impact` 也能终止；而 32 跳后两版都停在
+  `alias_chain_limit`，末端变化传不过来，故不会误报。超过显式深度的尾部
+  名字仍由多层虚拟探针（`ww-*`/`w-*`）代表。
 
 ### 变更模式选择子（selector）
 
@@ -64,7 +70,8 @@ BIND 文本（基线 `baseline` 与候选 `candidate`），枚举**域内所有�
 > 模式内任一 `(名称, 类型)` 的两版应答都不同；模式外任一名称都相同。
 
 无限名称空间由“两版区域的标记名 trie + 每节点一对虚拟新鲜标签（`w-*`、
-`ww-*`）”有限化，因此覆盖率可证明、可回归测试。
+`ww-*`）”有限化，因此覆盖率可证明、可回归测试。DNAME 拉回闭包额外受
+32 跳别名上限约束（自引用规则不会让 trie 无限增长）。
 
 ---
 
@@ -247,6 +254,125 @@ leaf.e         wildcard_expansion -> exact            # 精确名压过通配
 经 DNAME 命中时，应答按线格式为 `[合成 CNAME, 真实 DNAME, ...目标 RRset]`，
 `alias_chain` 逐跳给出 `kind / owner / target / presented_cname_owner`。
 
+### 自引用 DNAME：`x.d DNAME d`（/impact 与 /resolve 一致）
+
+区域里两版都有自引用 DNAME `x.d DNAME d`，唯一差异是 `a.d` 的 A 地址。
+解析 `a.x.d` 时先按 RFC 6672 合成 `a.x.d CNAME a.d`，再在 `a.d` 取到 A；
+而 `a.x.x.d` 要走两跳（`a.x.x.d → a.x.d → a.d`），以此类推。朴素的目标侧
+拉回闭包会沿这条自引用规则无限生成 `x.d`、`x.x.d`、`x.x.x.d`……，使
+`POST /impact` 无响应。修复后闭包按解析器的**实际跳数**有限化：第
+*k* 层 `a.x^k.d` 需要 *k* 跳，只有 `k < 32` 建为显式标记；`k = 32` 时两版
+都在拿到末端 A **之前**停在 `alias_chain_limit`，应答相同，故不产生模式。
+
+```bash
+curl -sS http://localhost:8080/impact \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "origin": "example.",
+    "types": ["A"],
+    "baseline": "$ORIGIN example.\n$TTL 3600\n@ SOA ns1 hm 1 7200 3600 1209600 60\n NS ns1\nns1 A 192.0.2.1\nx.d DNAME d\na.d A 192.0.2.10\n",
+    "candidate": "$ORIGIN example.\n$TTL 3600\n@ SOA ns1 hm 2 7200 3600 1209600 60\n NS ns1\nns1 A 192.0.2.1\nx.d DNAME d\na.d A 192.0.2.11\n"
+  }'
+```
+
+真实响应（约 1.5s 返回；32 个模式按从深到浅排序，下面给出头部、首模式
+完整见证与末模式，中间用 `...` 省略）：
+
+```json
+{
+  "origin": "example.",
+  "compared_types": ["A"],
+  "coverage": {
+    "probe_cells_per_type": 201,
+    "changed_cells_total": 32,
+    "note": "probe_cells_per_type 个等价类覆盖域内全部名称；每个模式的 scope 减去 exclude 后两两互斥且并集恰为变更集。"
+  },
+  "type_summary": [ { "type": "A", "changed_cells": 32, "patterns": 32 } ],
+  "patterns": [
+    {
+      "scope": { "selector": "a.x.x.d", "kind": "exact", "name": "a.x.x.d" },
+      "...": "（a.x^31.d … a.x.x.d 共 30 个同形精确模式，此处省略）"
+    },
+    {
+      "scope": { "selector": "a.x.d", "kind": "exact", "name": "a.x.d" },
+      "exclude": [],
+      "witness": { "name": "a.x.d", "probe_kind": "exact" },
+      "baseline": {
+        "qname": "a.x.d", "qtype": "A", "rcode": "NOERROR", "aa": true,
+        "termination": "exact",
+        "answer": [
+          { "name": "a.x.d", "type": "CNAME", "ttl": 3600,
+            "records": [ { "target": "a.d.example." } ] },
+          { "name": "x.d", "type": "DNAME", "ttl": 3600,
+            "records": [ { "target": "d.example." } ] },
+          { "name": "a.d", "type": "A", "ttl": 3600,
+            "records": [ { "address": "192.0.2.10" } ] }
+        ],
+        "authority": [], "additional": [],
+        "wildcard_source": null, "dname_encloser": "x.d",
+        "alias_chain": [
+          { "kind": "DNAME", "owner": "x.d",
+            "target": "a.d.example.",
+            "presented_cname_owner": "a.x.d" }
+        ]
+      },
+      "candidate": {
+        "qname": "a.x.d", "qtype": "A", "rcode": "NOERROR", "aa": true,
+        "termination": "exact",
+        "answer": [
+          { "name": "a.x.d", "type": "CNAME", "ttl": 3600,
+            "records": [ { "target": "a.d.example." } ] },
+          { "name": "x.d", "type": "DNAME", "ttl": 3600,
+            "records": [ { "target": "d.example." } ] },
+          { "name": "a.d", "type": "A", "ttl": 3600,
+            "records": [ { "address": "192.0.2.11" } ] }
+        ],
+        "authority": [], "additional": [],
+        "wildcard_source": null, "dname_encloser": "x.d",
+        "alias_chain": [
+          { "kind": "DNAME", "owner": "x.d",
+            "target": "a.d.example.",
+            "presented_cname_owner": "a.x.d" }
+        ]
+      },
+      "types": ["A"]
+    },
+    {
+      "scope": { "selector": "a.d", "kind": "exact", "name": "a.d" },
+      "...": "（a.d 本身 0 跳精确命中，基线 192.0.2.10 → 候选 192.0.2.11）"
+    }
+  ]
+}
+```
+
+32 个模式恰好是 `a.d`（0 跳）与 `a.x.d`、`a.x.x.d`、…、`a.x^31.d`
+（1..31 跳），全部 `exclude` 为空、`probe_kind` 为 `exact`；见证应答就是
+`/resolve` 对同名查询返回的完整应答（每个深层模式的应答含 *k* 对
+`[合成 CNAME, DNAME]` 后接末端 A）。`a.x^32.d` 及更深的名字**不在**任何
+模式里——与 `/resolve` 逐点一致：
+
+```bash
+# 同一对区域；把 name 换成 a.<31 个 x.>d 与 a.<32 个 x.>d 对照
+curl -sS http://localhost:8080/resolve -H 'Content-Type: application/json' -d '{
+  "origin": "example.", "name": "a.x.d", "type": "A",
+  "baseline": "$ORIGIN example.\n$TTL 3600\n@ SOA ns1 hm 1 7200 3600 1209600 60\n NS ns1\nns1 A 192.0.2.1\nx.d DNAME d\na.d A 192.0.2.10\n",
+  "candidate": "$ORIGIN example.\n$TTL 3600\n@ SOA ns1 hm 2 7200 3600 1209600 60\n NS ns1\nns1 A 192.0.2.1\nx.d DNAME d\na.d A 192.0.2.11\n"
+}'
+```
+
+| 查询名 | 跳数 | 两版 termination | 末端 | `identical` |
+| --- | --- | --- | --- | --- |
+| `a.x.d`（1 层 x） | 1 | `exact` → `exact` | `.10` → `.11` | **false** |
+| `a.x…x.d`（31 层 x） | 31 | `exact` → `exact` | `.10` → `.11` | **false** |
+| `a.x…x.d`（32 层 x） | 32 | `alias_chain_limit` → `alias_chain_limit` | 不再查询 `a.d` | **true** |
+
+32 层查询的应答（两侧相同）含 32 条合成 CNAME——第一跳的
+`CNAME a.x^32.d → a.x^31.d` 与真实 DNAME 在前，最后一条是
+`a.x.d → a.d`，但解析在此终止、不去取 `a.d` 的 A，所以 A 地址的改动传
+不过来，既不漏掉上限前的 31 层变化，也不会把上限后的名字误报为变更。
+不经过 `a.d` 的名字（如 `x.x.d`、`y.x^k.d`）两版同为
+NXDOMAIN/`alias_chain_limit`，同样不产生模式。
+
 ### `POST /resolve`：核对单个名称/类型
 
 下面核对**新增叶子 `new` 后，其下级 `x.new` 是否被误判**：
@@ -322,7 +448,7 @@ curl -sS http://localhost:8080/resolve \
 app/
   zone.py       # BIND 逐记录解析 + 越区/外部引用/委派校验；构建空非终结点/通配父节点集合
   resolver.py   # 离线权威解析：切点、最近包围名（含 ENT/通配父）、通配与 DNAME 合成、别名逐跳
-  diff.py       # 标记 trie、DNAME 拉回闭包、探针分区、未列名空洞排除与互斥完备模式归并
+  diff.py       # 标记 trie、按别名跳数有限化的 DNAME 拉回闭包、探针分区、未列名空洞排除与互斥完备模式归并
   serial.py     # Answer / Pattern 的 JSON 序列化
   main.py       # FastAPI：POST /impact、POST /resolve、GET /healthz
 tests/
@@ -340,5 +466,5 @@ PYTHONPATH=. python3 tests/test_engine.py     # 或：pytest -q
 ```
 
 测试含数千个随机名称的性质校验：**变化名恰好落入一个模式、未变化名不落
-入任何模式、模式之间互不重叠**，并覆盖通配 / DNAME（含目标子树未列名）/
-ENT / 委派 / 别名环等情形。
+入任何模式、模式之间互不重叠**，并覆盖通配 / DNAME（含目标子树未列名与
+自引用 DNAME 的 32 跳边界）/ ENT / 委派 / 别名环等情形。
